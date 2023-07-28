@@ -4,10 +4,13 @@ A module which combines SAM (segment anything) with point tracking to perform vi
 
 import numpy as np
 import torch
+import cv2
 
+from einops import rearrange
 from segment_anything.modeling import Sam
 from segment_anything import SamPredictor
-from sam_pt.modeling.pers.predictor import SamPredictor as PersSamPredictor
+from sam_pt.modeling.personalize.personalize_utils import point_selection, calculate_dice_loss, calculate_sigmoid_focal_loss, Mask_Weights
+from sam_pt.modeling.personalize.predictor import SamPredictor as PersSamPredictor
 
 from skimage import color
 from torch import nn
@@ -120,88 +123,99 @@ class SamPt(nn.Module):
         return self._sam.device
 
     # TODO: Move me down
-    def _personalize(self, ref_image: torch.Tensor, ref_mask: torch.Tensor):
-        print(ref_image.shape, ref_mask.shape)
-        gt_mask = ref_mask.float().to(self.device)
-        print(gt_mask.shape)
+    def _personalize(self, ref_images: torch.Tensor, ref_masks: torch.Tensor):
+        print(ref_images.shape, ref_masks.shape)
+        gt_masks = ref_masks.float().to(self.device)
+        print(gt_masks.shape)
         print("======> Obtain Self Location Prior")
         # Image features encoding
 
         # TODO, self?
         predictor = PersSamPredictor(self._sam)
 
-        #TODO: Create custom predictor using personalize sam version
+        # TODO: Create custom predictor using personalize sam version
         # Repeat for each image creating batch of personalized weights
-        ref_mask = predictor.set_image(ref_image.cpu().numpy(), ref_mask)
-        ref_feat = predictor.features.squeeze().permute(1, 2, 0)
+        # TODO: Batch this!
 
-        ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
-        ref_mask = ref_mask.squeeze()[0]
-
-        # Target feature extraction
-        target_feat = ref_feat[ref_mask > 0]
-        target_feat_mean = target_feat.mean(0)
-        target_feat_max = torch.max(target_feat, dim=0)[0]
-        target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
-
-        # Cosine similarity
-        h, w, C = ref_feat.shape
-        target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
-        ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
-        ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
-        sim = target_feat @ ref_feat
-
-        sim = sim.reshape(1, 1, h, w)
-        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
-        sim = predictor.model.postprocess_masks(
-                        sim,
-                        input_size=predictor.input_size,
-                        original_size=predictor.original_size).squeeze()
-
-        # Positive location prior
-        topk_xy, topk_label, _, _ = point_selection(sim, topk=1)
-
-        print('======> Start Training')
-        # Learnable mask weights
-        mask_weights = Mask_Weights().to(DEVICE)
-        # mask_weights = Mask_Weights()
+        B, _, _ = ref_masks.shape
+        mask_weights = nn.ParameterList([Mask_Weights() for _ in range(B)]).to(self.device)
         mask_weights.train()
-        train_epoch = 1000
-        optimizer = torch.optim.AdamW(mask_weights.parameters(), lr=1e-3, eps=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, train_epoch)
+        for weights, gt_mask, ref_image, ref_mask in zip(mask_weights, gt_masks, ref_images, ref_masks):
+            # TODO: Temporary convert to expected format by set_image
+            print('For loop shapes:', ref_image.shape, ref_mask.shape)
+            ref_image = rearrange(ref_image, 'c h w -> h w c')
+            ref_mask = cv2.cvtColor(ref_mask.cpu().numpy().astype(np.uint8) * 255, cv2.COLOR_GRAY2RGB)
+            print('For loop rearrange:', ref_image.shape, ref_mask.shape)
 
-        for train_idx in range(train_epoch):
-            # Run the decoder
-            masks, scores, logits, logits_high = self.sam_predictor.predict(
-                point_coords=topk_xy,
-                point_labels=topk_label,
-                multimask_output=True)
-            logits_high = logits_high.flatten(1)
+            ref_mask = predictor.set_image(ref_image.cpu().numpy(), ref_mask)
+            ref_feat = predictor.features.squeeze().permute(1, 2, 0)
 
-            # Weighted sum three-scale masks
+            ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
+            ref_mask = ref_mask.squeeze()[0]
+
+            # Target feature extraction
+            target_feat = ref_feat[ref_mask > 0]
+            target_feat_mean = target_feat.mean(0)
+            target_feat_max = torch.max(target_feat, dim=0)[0]
+            target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+
+            # Cosine similarity
+            h, w, C = ref_feat.shape
+            target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
+            ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
+            ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
+            sim = target_feat @ ref_feat
+
+            sim = sim.reshape(1, 1, h, w)
+            sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+            sim = predictor.model.postprocess_masks(
+                sim,
+                input_size=predictor.input_size,
+                original_size=predictor.original_size).squeeze()
+
+            # Positive location prior
+            topk_xy, topk_label, _, _ = point_selection(sim, topk=1)
+
+            print(f'Topk_xy shape: {topk_xy.shape}')
+            print(f'Topk_label shape: {topk_label.shape}')
+
+            print('======> Start Training')
+            # Learnable mask weights
+            train_epoch = 1000
+            optimizer = torch.optim.AdamW(weights.parameters(), lr=1e-3, eps=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, train_epoch)
+
+            for train_idx in range(train_epoch):
+                # Run the decoder
+                masks, scores, logits, logits_high = predictor.predict(
+                    point_coords=topk_xy,
+                    point_labels=topk_label,
+                    multimask_output=True)
+                logits_high = logits_high.flatten(1)
+
+                # Weighted sum three-scale masks
+                weights = torch.cat((1 - weights.weights.sum(0).unsqueeze(0), weights.weights), dim=0)
+                logits_high = logits_high * weights
+                logits_high = logits_high.sum(0).unsqueeze(0)
+
+                dice_loss = calculate_dice_loss(logits_high, gt_mask)
+                focal_loss = calculate_sigmoid_focal_loss(logits_high, gt_mask)
+                loss = dice_loss + focal_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                if train_idx % 10 == 0:
+                    print('Train Epoch: {:} / {:}'.format(train_idx, train_epoch))
+                    current_lr = scheduler.get_last_lr()[0]
+                    print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(), focal_loss.item()))
+
+            mask_weights.eval()
             weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
-            logits_high = logits_high * weights
-            logits_high = logits_high.sum(0).unsqueeze(0)
-
-            dice_loss = calculate_dice_loss(logits_high, gt_mask)
-            focal_loss = calculate_sigmoid_focal_loss(logits_high, gt_mask)
-            loss = dice_loss + focal_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            if train_idx % 10 == 0:
-                print('Train Epoch: {:} / {:}'.format(train_idx, train_epoch))
-                current_lr = scheduler.get_last_lr()[0]
-                print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(), focal_loss.item()))
-
-
-        mask_weights.eval()
-        weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
-        weights_np = weights.detach().cpu().numpy()
-        print('======> Mask weights:\n', weights_np)
+            weights_np = weights.detach().cpu().numpy()
+            print('======> Mask weights:\n', weights_np)
 
     def forward(self, video):
         """
@@ -247,27 +261,45 @@ class SamPt(nn.Module):
             raise NotImplementedError(f"{self._get_name()} does not support training...")
 
         # Unpack images
-        images = torch.stack(video["image"], dim=0)
-        n_frames, channels, height, width = images.shape
-        assert images[0].dtype == torch.uint8, "Input images must be in uint8 format (0-255)"
+        # images = torch.stack(video["image"], dim=0)
+        # n_frames, channels, height, width = images.shape
+        # assert images[0].dtype == torch.uint8, "Input images must be in uint8 format (0-255)"
 
-        # Prepare queries
-        if video.get("query_masks") is not None:  # E.g., when evaluating on the VOS task
-            assert video.get("query_points") is None
-            print("SAM: Using query masks")
-            query_masks = video["query_masks"].float()
-            query_points_timestep = video["query_point_timestep"]
-            query_points = self.extract_query_points(images, query_masks, query_points_timestep)
-            query_scores = None
-        elif video.get("query_points") is not None:  # E.g., when evaluating on the railway demo
-            print("SAM: Using query points")
-            query_points = video["query_points"]
-            query_masks = self.extract_query_masks(images, query_points)
-            query_scores = None
-        else:
-            raise ValueError("No query points or masks provided")
+        # # Prepare queries
+        # if video.get("query_masks") is not None:  # E.g., when evaluating on the VOS task
+        #     assert video.get("query_points") is None
+        #     print("SAM: Using query masks")
+        #     query_masks = video["query_masks"].float()
+        #     query_points_timestep = video["query_point_timestep"]
+        #     query_points = self.extract_query_points(images, query_masks, query_points_timestep)
+        #     query_scores = None
+        # elif video.get("query_points") is not None:  # E.g., when evaluating on the railway demo
+        #     print("SAM: Using query points")
+        #     query_points = video["query_points"]
+        #     query_masks = self.extract_query_masks(images, query_points)
+        #     query_scores = None
+        # else:
+        #     raise ValueError("No query points or masks provided")
+        # n_masks, n_points_per_mask, _ = query_points.shape
+        # assert query_masks.shape == (n_masks, height, width)
+
+        # TODO: Remove me only for testing
+        # np.save('images_backup.npy', images.cpu().numpy())
+        # np.save('query_masks.npy', query_masks.cpu().numpy())
+        # np.save('query_points.npy', query_points.cpu().numpy())
+        # query_scores = None
+        # assert False
+
+        saved_path = '/Users/junkybyte/Documents/sam-pt/'
+        import os
+        images = torch.from_numpy(np.load(os.path.join(saved_path, 'images_backup.npy')))
+        query_masks = torch.from_numpy(np.load(os.path.join(saved_path, 'query_masks.npy')))
+        query_points = torch.from_numpy(np.load(os.path.join(saved_path, 'query_points.npy')))
+        query_scores = None
+        n_frames, channels, height, width = images.shape
         n_masks, n_points_per_mask, _ = query_points.shape
         assert query_masks.shape == (n_masks, height, width)
+        ##############
 
         # The SuperGlue point tracker performs keypoint matching and requires the query mask to be set
         if isinstance(self.point_tracker, SuperGluePointTracker):
@@ -757,17 +789,17 @@ class SamPt(nn.Module):
                     query_timestep = int(query_points[mask_idx, point_idx, 0].item())
                     for frame_idx in range(query_timestep + 1, n_frames):
                         if visibilities_pred[
-                            frame_idx, mask_idx, point_idx] != PointVisibilityType.PATCH_NON_SIMILAR.value:
+                                frame_idx, mask_idx, point_idx] != PointVisibilityType.PATCH_NON_SIMILAR.value:
                             continue
                         visibilities_pred[frame_idx + 1:, mask_idx,
-                        point_idx] = PointVisibilityType.REJECTED_AFTER_PATCH_WAS_NON_SIMILAR.value
+                                          point_idx] = PointVisibilityType.REJECTED_AFTER_PATCH_WAS_NON_SIMILAR.value
                         break
                     for frame_idx in range(query_timestep - 1, -1, -1):
                         if visibilities_pred[
-                            frame_idx, mask_idx, point_idx] != PointVisibilityType.PATCH_NON_SIMILAR.value:
+                                frame_idx, mask_idx, point_idx] != PointVisibilityType.PATCH_NON_SIMILAR.value:
                             continue
                         visibilities_pred[:frame_idx:, mask_idx,
-                        point_idx] = PointVisibilityType.REJECTED_AFTER_PATCH_WAS_NON_SIMILAR.value
+                                          point_idx] = PointVisibilityType.REJECTED_AFTER_PATCH_WAS_NON_SIMILAR.value
                         break
 
         # Denote out-of-frame points for visualisation debugging purposes
@@ -826,7 +858,7 @@ class SamPt(nn.Module):
             if n_masks > 1 and self.add_other_objects_positive_points_as_negative_points:
                 other_objects_positive_point_coords = torch.cat([
                     trajectories[frame_idx, other_mask_idx, :self.positive_points_per_mask, :][
-                    visibilities[frame_idx, other_mask_idx, :self.positive_points_per_mask] == 1, :]
+                        visibilities[frame_idx, other_mask_idx, :self.positive_points_per_mask] == 1, :]
                     for other_mask_idx in range(n_masks) if other_mask_idx != mask_idx
                 ], dim=0).cpu().numpy()
                 other_objects_positive_point_labels = np.zeros((len(other_objects_positive_point_coords)),
