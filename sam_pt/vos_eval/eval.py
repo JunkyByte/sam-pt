@@ -129,7 +129,7 @@ def evaluate(cfg):
     else:
         out_path = cfg.output
 
-    torch.autograd.set_grad_enabled(False)
+    # torch.autograd.set_grad_enabled(False)  # TODO
 
     # Set up loader
     meta_loader = meta_dataset.get_datasets()
@@ -223,7 +223,7 @@ def evaluate(cfg):
                 point_coords = extract_kmedoid_points(gt_mask_list[mask_idx], n_points_to_select=1).numpy()
                 timestep = gt_ti_list[mask_idx]
                 model.sam_predictor.set_image(rgbs[timestep].permute(1, 2, 0).cpu().numpy())
-                mask_frame_logits, iou_prediction_scores, low_res_masks = model.sam_predictor.predict(
+                mask_frame_logits, iou_prediction_scores, low_res_masks, _ = model.sam_predictor.predict(
                     point_coords=point_coords,
                     point_labels=np.ones(len(point_coords)),
                     mask_input=None,

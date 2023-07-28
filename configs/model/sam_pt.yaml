@@ -5,7 +5,7 @@ defaults:
   - sam@sam_predictor.sam_model: sam_vit_huge
 
 sam_predictor:
-  _target_: segment_anything.predictor.SamPredictor
+  _target_: sam_pt.modeling.personalize.predictor.SamPredictor
 
 sam_iou_threshold: 0.7
 
@@ -27,6 +27,7 @@ use_point_reinit: false
 reinit_point_tracker_horizon: 8
 reinit_horizon: 8
 reinit_variant: "reinit-on-horizon-and-sync-masks"
+personalize: true
 # Reinitialization variants:
 #  A) reinit-on-horizon-and-sync-masks:
 #     - simplest variant: reinitialize the points after a fixed number of

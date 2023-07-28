@@ -5,7 +5,7 @@ for loading checkpoints and storing additional parameters that we used for varia
 
 import torch
 from mobile_sam.modeling import Sam as MobileSam
-from segment_anything.modeling import Sam
+from sam_pt.modeling.personalize.modeling.sam import Sam
 from segment_anything_hq.modeling import Sam as SamHQ
 
 
