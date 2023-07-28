@@ -9,7 +9,8 @@ sam_predictor:
 
 sam_iou_threshold: 0.7
 
-iterative_refinement_iterations: 12
+iterative_refinement_iterations: 1
+  # iterative_refinement_iterations: 12
 
 positive_point_selection_method: "kmedoids" # kmedoids, shi-tomasi, random, mixed
 negative_point_selection_method: "mixed" # kmedoids, shi-tomasi, random, mixed
