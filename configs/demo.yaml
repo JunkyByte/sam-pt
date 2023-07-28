@@ -13,6 +13,7 @@ model:
   use_point_reinit: false
   positive_points_per_mask: -1
   negative_points_per_mask: -1
+  personalize: true
 
 frames_path: ${hydra:runtime.cwd}/data/demo_data/bees # Path to the folder with frames of the video
 query_points_path: ${hydra:runtime.cwd}/data/demo_data/query_points__bees.txt # Path or null

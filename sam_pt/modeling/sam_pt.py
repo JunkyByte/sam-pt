@@ -4,8 +4,11 @@ A module which combines SAM (segment anything) with point tracking to perform vi
 
 import numpy as np
 import torch
-from segment_anything import SamPredictor
+
 from segment_anything.modeling import Sam
+from segment_anything import SamPredictor
+from sam_pt.modeling.pers.predictor import SamPredictor as PersSamPredictor
+
 from skimage import color
 from torch import nn
 from torch.nn import functional as F
@@ -40,6 +43,7 @@ class SamPt(nn.Module):
             patch_size: int,
             patch_similarity_threshold: float,
             use_point_reinit: bool,
+            personalize: bool,
             reinit_point_tracker_horizon: int,
             reinit_horizon: int,
             reinit_variant: str,
@@ -87,6 +91,7 @@ class SamPt(nn.Module):
         self.point_tracker = point_tracker
         self.sam_predictor = sam_predictor
         self.sam_iou_threshold = sam_iou_threshold
+        self.personalize = personalize
 
         # Make baseline.to(device) work since the predictor is not a nn.Module
         self._sam: Sam = sam_predictor.model
@@ -113,6 +118,90 @@ class SamPt(nn.Module):
     @property
     def device(self):
         return self._sam.device
+
+    # TODO: Move me down
+    def _personalize(self, ref_image: torch.Tensor, ref_mask: torch.Tensor):
+        print(ref_image.shape, ref_mask.shape)
+        gt_mask = ref_mask.float().to(self.device)
+        print(gt_mask.shape)
+        print("======> Obtain Self Location Prior")
+        # Image features encoding
+
+        # TODO, self?
+        predictor = PersSamPredictor(self._sam)
+
+        #TODO: Create custom predictor using personalize sam version
+        # Repeat for each image creating batch of personalized weights
+        ref_mask = predictor.set_image(ref_image.cpu().numpy(), ref_mask)
+        ref_feat = predictor.features.squeeze().permute(1, 2, 0)
+
+        ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
+        ref_mask = ref_mask.squeeze()[0]
+
+        # Target feature extraction
+        target_feat = ref_feat[ref_mask > 0]
+        target_feat_mean = target_feat.mean(0)
+        target_feat_max = torch.max(target_feat, dim=0)[0]
+        target_feat = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+
+        # Cosine similarity
+        h, w, C = ref_feat.shape
+        target_feat = target_feat / target_feat.norm(dim=-1, keepdim=True)
+        ref_feat = ref_feat / ref_feat.norm(dim=-1, keepdim=True)
+        ref_feat = ref_feat.permute(2, 0, 1).reshape(C, h * w)
+        sim = target_feat @ ref_feat
+
+        sim = sim.reshape(1, 1, h, w)
+        sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
+        sim = predictor.model.postprocess_masks(
+                        sim,
+                        input_size=predictor.input_size,
+                        original_size=predictor.original_size).squeeze()
+
+        # Positive location prior
+        topk_xy, topk_label, _, _ = point_selection(sim, topk=1)
+
+        print('======> Start Training')
+        # Learnable mask weights
+        mask_weights = Mask_Weights().to(DEVICE)
+        # mask_weights = Mask_Weights()
+        mask_weights.train()
+        train_epoch = 1000
+        optimizer = torch.optim.AdamW(mask_weights.parameters(), lr=1e-3, eps=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, train_epoch)
+
+        for train_idx in range(train_epoch):
+            # Run the decoder
+            masks, scores, logits, logits_high = self.sam_predictor.predict(
+                point_coords=topk_xy,
+                point_labels=topk_label,
+                multimask_output=True)
+            logits_high = logits_high.flatten(1)
+
+            # Weighted sum three-scale masks
+            weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
+            logits_high = logits_high * weights
+            logits_high = logits_high.sum(0).unsqueeze(0)
+
+            dice_loss = calculate_dice_loss(logits_high, gt_mask)
+            focal_loss = calculate_sigmoid_focal_loss(logits_high, gt_mask)
+            loss = dice_loss + focal_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if train_idx % 10 == 0:
+                print('Train Epoch: {:} / {:}'.format(train_idx, train_epoch))
+                current_lr = scheduler.get_last_lr()[0]
+                print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(), focal_loss.item()))
+
+
+        mask_weights.eval()
+        weights = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
+        weights_np = weights.detach().cpu().numpy()
+        print('======> Mask weights:\n', weights_np)
 
     def forward(self, video):
         """
@@ -184,6 +273,11 @@ class SamPt(nn.Module):
         if isinstance(self.point_tracker, SuperGluePointTracker):
             assert self.point_tracker_mask_batch_size >= n_masks
             self.point_tracker.set_masks(query_masks)
+
+        # Finetune
+        if self.personalize:
+            query_images = images[query_points[:, 0, 0].cpu().numpy()]
+            weights = self._personalize(query_images.to(self.device), query_masks)
 
         # Run tracking
         self.frame_annotations = [[] for _ in range(n_frames)]

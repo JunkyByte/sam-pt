@@ -108,7 +108,10 @@ def load_model(cfg, positive_points_per_mask, negative_points_per_mask):
     cfg.model.positive_points_per_mask = positive_points_per_mask
     cfg.model.negative_points_per_mask = negative_points_per_mask
     model = instantiate(cfg.model)
-    return model.to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    device = ('cuda' if torch.cuda.is_available() else
+              'mps' if torch.backends.mps.is_available() else
+              'cpu')
+    return model.to(device).eval()
 
 
 def run_inference(model, rgbs, query_points, target_hw):
